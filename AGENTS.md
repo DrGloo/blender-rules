@@ -324,6 +324,83 @@ Every mesh must pass these checks before export:
 5. **Delete loose geometry** — remove floating vertices and edges.
 6. **Remove interior faces** — delete hidden geometry (insides of walls, bottoms of placed furniture).
 
+### Invisible Collision Space (Critical for Roblox)
+
+Roblox MeshParts use their bounding box or collision mesh for physics. If a mesh has hidden/interior faces, offset origins, loose vertices extending beyond the visible surface, or was merged from distant objects with gaps between them, players will collide with "invisible" space — they'll walk on air or hit walls that aren't there.
+
+**Root causes and fixes:**
+
+| Cause | Fix |
+|---|---|
+| **Merged distant objects** | Never merge objects that aren't physically touching. Each formation/structure must be its own mesh so its bounding box tightly wraps only that geometry. |
+| **Interior/hidden faces** | Delete faces trapped inside overlapping geometry (e.g., the bottom of a cylinder sitting on a cube). Use `Select Interior Faces` or manual selection. |
+| **Loose vertices/edges** | Run `bpy.ops.mesh.delete_loose()` — stray vertices far from the surface silently expand the bounding box. |
+| **Origin offset** | Reset origin to geometry center with `bpy.ops.object.origin_set(type='ORIGIN_GEOMETRY', center='BOUNDS')`. An origin far from the mesh shifts the collision box. |
+| **Overlapping merged layers** | When merging stacked layers (e.g., mesa bands), use `Remove Doubles` / merge-by-distance aggressively to fuse shared vertices. |
+
+**Aggressive cleanup script (run on every mesh before export):**
+
+```python
+import bpy
+
+obj = bpy.data.objects.get("ObjectName")
+if obj is None:
+    raise ValueError("Object 'ObjectName' not found")
+
+bpy.ops.object.select_all(action='DESELECT')
+obj.select_set(True)
+bpy.context.view_layer.objects.active = obj
+
+# Apply all transforms so bounds are accurate
+bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+
+bpy.ops.object.mode_set(mode='EDIT')
+bpy.ops.mesh.select_all(action='SELECT')
+
+# Remove doubles aggressively
+bpy.ops.mesh.remove_doubles(threshold=0.05)
+
+# Delete loose geometry (expands bounding box invisibly)
+bpy.ops.mesh.delete_loose(use_verts=True, use_edges=True, use_faces=True)
+
+# Delete interior faces (hidden geometry that inflates collision)
+bpy.ops.mesh.select_all(action='DESELECT')
+bpy.ops.mesh.select_interior_faces()
+bpy.ops.mesh.delete(type='FACE')
+
+# Recalculate normals
+bpy.ops.mesh.select_all(action='SELECT')
+bpy.ops.mesh.normals_make_consistent(inside=False)
+
+bpy.ops.object.mode_set(mode='OBJECT')
+
+# Reset origin to tight geometry center
+bpy.ops.object.origin_set(type='ORIGIN_GEOMETRY', center='BOUNDS')
+
+print(f"Aggressive cleanup done on '{obj.name}'")
+```
+
+**Merge rules to prevent invisible collision:**
+
+- **Same formation, touching geometry** → safe to merge (e.g., stacked mesa layers)
+- **Nearby but separated objects** → do NOT merge (e.g., two mesas 50 studs apart)
+- **Rule of thumb:** if there's walkable space between two objects, they must be separate meshes
+
+**Post-cleanup bounding box audit:**
+
+```python
+import bpy
+
+for obj in bpy.data.objects:
+    if obj.type != 'MESH':
+        continue
+    bb = [obj.matrix_world @ mathutils.Vector(corner) for corner in obj.bound_box]
+    dims = obj.dimensions
+    print(f"{obj.name}: bounds {dims.x:.1f} x {dims.y:.1f} x {dims.z:.1f}")
+```
+
+If a mesh's bounding box dimensions are significantly larger than its visible geometry, it has invisible collision space that needs fixing.
+
 ### Double-Sided Face Handling
 
 Roblox renders meshes **single-sided** by default. Thin objects (leaves, paper, banners, cloth) will be invisible from one side unless handled:
@@ -563,6 +640,9 @@ The agent must run this checklist before every export:
 | Normals facing outward       | No flipped normals                      |
 | No loose geometry            | No floating verts/edges                 |
 | No interior faces            | Hidden geometry removed                 |
+| No invisible collision space | Bounding box tightly wraps visible geo  |
+| No distant-object merges     | Only merge physically touching geometry |
+| Origins at geometry center   | `ORIGIN_GEOMETRY` with `BOUNDS` center  |
 | One material per object      | Clean SurfaceAppearance mapping         |
 | UV maps present              | On every textured mesh                  |
 | Procedurals baked            | No unbaked procedural materials         |
@@ -755,6 +835,7 @@ obj.keyframe_insert(data_path="location", frame=60)
 | Script fails with context error | Set `view_layer.objects.active` before `bpy.ops` calls|
 | Modifier not applying           | Check object mode — most modifiers need Object Mode   |
 | Texture not appearing           | Verify UV map exists and material uses correct image   |
+| Invisible collision in Roblox   | Remove interior faces, delete loose geo, reset origin, never merge distant objects — see "Invisible Collision Space" section |
 
 ### Debugging Workflow
 
