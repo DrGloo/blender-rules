@@ -230,6 +230,398 @@ Same polling strategy as Hyper3D. Hunyuan supports combined text + image input f
 
 ---
 
+## Roblox Export Standards
+
+All models and maps built in Blender are destined for Roblox. Every modeling decision must respect these constraints.
+
+### Hard Limits
+
+| Constraint                  | Limit                     |
+|-----------------------------|---------------------------|
+| Meshes per import           | < 200                     |
+| Triangles per MeshPart      | < 10,000                  |
+| Texture resolution          | 1024x1024 max             |
+| Materials per MeshPart      | 1 (one SurfaceAppearance) |
+| Export format               | `.fbx`                    |
+
+These are non-negotiable. The agent must check and enforce them before every export.
+
+### Triangle Budget
+
+- **Target 5,000–8,000 triangles** per mesh to leave headroom
+- After every modeling step, print the triangle count:
+
+```python
+import bpy
+
+obj = bpy.data.objects.get("ObjectName")
+if obj is None:
+    raise ValueError("Object 'ObjectName' not found")
+
+depsgraph = bpy.context.evaluated_depsgraph_get()
+evaluated = obj.evaluated_get(depsgraph)
+mesh = evaluated.to_mesh()
+mesh.calc_loop_triangles()
+tri_count = len(mesh.loop_triangles)
+evaluated.to_mesh_clear()
+print(f"'{obj.name}' triangle count: {tri_count}")
+```
+
+- If a mesh exceeds 10,000 triangles, apply a Decimate modifier and report before/after count
+- Always report total triangle count across all meshes when working on a map
+
+### Decimate Strategy
+
+Choose the right Decimate mode based on the geometry:
+
+| Mode            | Best For                                          |
+|-----------------|---------------------------------------------------|
+| **Collapse**    | General-purpose poly reduction on any mesh        |
+| **Un-Subdivide**| Meshes that were previously subdivided             |
+| **Planar**      | Flat surfaces with unnecessary edges (common in AI-generated models) |
+
+AI-generated models (Hyper3D, Hunyuan3D) almost always arrive over budget. Run Planar dissolve first to clean flat regions, then Collapse to hit the target count. Always print the count before and after:
+
+```python
+import bpy
+
+obj = bpy.data.objects.get("GeneratedModel")
+if obj is None:
+    raise ValueError("Object 'GeneratedModel' not found")
+
+# Print before count
+depsgraph = bpy.context.evaluated_depsgraph_get()
+evaluated = obj.evaluated_get(depsgraph)
+mesh_eval = evaluated.to_mesh()
+mesh_eval.calc_loop_triangles()
+before = len(mesh_eval.loop_triangles)
+evaluated.to_mesh_clear()
+
+# Add Decimate modifier
+mod = obj.modifiers.new(name="DecimatePlanar", type='DECIMATE')
+mod.decimate_type = 'DISSOLVE'
+mod.angle_limit = 0.087  # ~5 degrees
+
+# Print after count
+depsgraph = bpy.context.evaluated_depsgraph_get()
+evaluated = obj.evaluated_get(depsgraph)
+mesh_eval = evaluated.to_mesh()
+mesh_eval.calc_loop_triangles()
+after = len(mesh_eval.loop_triangles)
+evaluated.to_mesh_clear()
+
+print(f"'{obj.name}' triangles: {before} → {after}")
+```
+
+### Geometry Cleanup (Required Before Export)
+
+Every mesh must pass these checks before export:
+
+1. **Triangulate** — apply Triangulate modifier or `bpy.ops.mesh.quads_convert_to_tris()`. Roblox does not support quads or n-gons.
+2. **Apply all transforms** — `bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)`.
+3. **Recalculate normals outward** — `bpy.ops.mesh.normals_make_consistent(inside=False)` in Edit Mode.
+4. **Remove doubles** — merge by distance to eliminate overlapping vertices.
+5. **Delete loose geometry** — remove floating vertices and edges.
+6. **Remove interior faces** — delete hidden geometry (insides of walls, bottoms of placed furniture).
+
+### Double-Sided Face Handling
+
+Roblox renders meshes **single-sided** by default. Thin objects (leaves, paper, banners, cloth) will be invisible from one side unless handled:
+
+- **Preferred:** Add a Solidify modifier with minimal thickness before export
+- **Alternative:** Duplicate the face, flip its normal, and merge — creates a two-sided surface
+- The agent must identify thin/planar objects and warn the user or apply Solidify automatically
+
+### Scale and Units
+
+Roblox 1 stud ~ 0.28 meters (roughly 1 foot). Choose one approach and stick with it:
+
+- **Option A:** Model at real-world scale, apply factor `0.28` on FBX export
+- **Option B:** Set Blender unit scale to `0.28` and model in stud-scale
+
+All models in a project must use the same approach. Mismatched scales cause sizing issues in Studio.
+
+### UV Unwrapping Requirements
+
+Every textured mesh **must** have a UV map before export. The agent should:
+
+1. **Check for UVs** after creating or importing any mesh:
+
+```python
+import bpy
+
+obj = bpy.data.objects.get("ObjectName")
+if obj is None:
+    raise ValueError("Object 'ObjectName' not found")
+
+if not obj.data.uv_layers:
+    print(f"WARNING: '{obj.name}' has no UV map — textures will not display in Roblox")
+```
+
+2. **Auto-unwrap** if no UV exists — use Smart UV Project as a safe default:
+
+```python
+import bpy
+
+obj = bpy.data.objects.get("ObjectName")
+bpy.context.view_layer.objects.active = obj
+bpy.ops.object.mode_set(mode='EDIT')
+bpy.ops.mesh.select_all(action='SELECT')
+bpy.ops.uv.smart_project(angle_limit=1.15, island_margin=0.02)
+bpy.ops.object.mode_set(mode='OBJECT')
+print(f"Smart UV Project applied to '{obj.name}'")
+```
+
+3. **Warn about UV issues** — stretching, overlapping islands, and missing UVs all cause broken textures in Roblox
+
+### Texture Baking (Critical for Roblox)
+
+Blender procedural materials (Noise, Voronoi, Wave, Musgrave, etc.) **do not transfer to Roblox**. Any procedural material must be baked to image textures before export.
+
+**When to bake:**
+- Any material using procedural texture nodes
+- Any material with complex node mixing
+- Materials from Polyhaven that use multiple texture maps through nodes
+
+**Bake targets** (match Roblox SurfaceAppearance channels):
+
+| Bake Type       | Roblox Channel   | Resolution  |
+|-----------------|------------------|-------------|
+| Diffuse/Color   | `ColorMap`       | 1024x1024   |
+| Normal          | `NormalMap`      | 1024x1024   |
+| Roughness       | `RoughnessMap`   | 1024x1024   |
+| Metallic        | `MetalnessMap`   | 1024x1024   |
+
+**Baking workflow:**
+
+```python
+import bpy
+
+obj = bpy.data.objects.get("ObjectName")
+if obj is None:
+    raise ValueError("Object 'ObjectName' not found")
+
+# Ensure UV map exists
+if not obj.data.uv_layers:
+    raise ValueError(f"'{obj.name}' needs a UV map before baking")
+
+# Create bake target image
+bake_image = bpy.data.images.new("BakedColor", width=1024, height=1024)
+
+# Add Image Texture node to material and set as active for baking
+mat = obj.data.materials[0]
+nodes = mat.node_tree.nodes
+bake_node = nodes.new(type='ShaderNodeTexImage')
+bake_node.image = bake_image
+nodes.active = bake_node
+
+# Set render engine to Cycles (required for baking)
+bpy.context.scene.render.engine = 'CYCLES'
+
+# Select object and bake
+bpy.context.view_layer.objects.active = obj
+obj.select_set(True)
+bpy.ops.object.bake(type='DIFFUSE')
+
+print(f"Baked diffuse texture for '{obj.name}'")
+```
+
+Repeat for each PBR channel. Save baked images to disk as PNG at 1024x1024.
+
+### Materials for Roblox
+
+Roblox `SurfaceAppearance` supports four PBR maps:
+
+| Blender Channel      | Roblox SurfaceAppearance |
+|----------------------|--------------------------|
+| Base Color           | `ColorMap`               |
+| Normal Map           | `NormalMap`              |
+| Metallic             | `MetalnessMap`           |
+| Roughness            | `RoughnessMap`           |
+
+Rules:
+- **One material per object** — each Blender object = one MeshPart with one SurfaceAppearance
+- **Texture atlas for maps** — consolidate textures into a single 1024x1024 atlas to reduce draw calls
+- **No textures larger than 1024x1024** — Roblox downscales anything bigger
+
+### Vertex Colors as a Texture Alternative
+
+For stylized or low-poly models, **vertex colors** are cheaper than image textures:
+
+- No UV map required
+- No texture memory overhead
+- Works well for flat-shaded, colorful props
+
+```python
+import bpy
+
+obj = bpy.data.objects.get("StylizedProp")
+if obj is None:
+    raise ValueError("Object 'StylizedProp' not found")
+
+# Create vertex color layer
+if not obj.data.vertex_colors:
+    obj.data.vertex_colors.new(name="Col")
+
+print(f"Vertex color layer created on '{obj.name}'")
+```
+
+Use vertex colors when the model is simple/stylized and doesn't need detailed textures. Use image textures for realistic or detailed surfaces.
+
+### Emissive and Special Materials
+
+**Emissive/Glow:** Blender Emission shader maps to Roblox **Neon** material. The agent should:
+- Note when a material uses emission and flag it for Neon material assignment in Studio
+- Bake emission to a separate texture if needed for the ColorMap
+
+**Transparency:** Roblox handles transparency through MeshPart `Transparency` property (0–1), not through material nodes. The agent should:
+- Warn that Blender alpha transparency does not export to Roblox
+- Flag transparent objects for manual `Transparency` setup in Studio
+
+**Glass/Reflections:** Not supported via mesh import. Use Roblox's built-in Glass material in Studio instead.
+
+### Object Structure
+
+- **One object = one MeshPart** — every piece that will be a separate MeshPart must be a separate Blender object
+- **Set origins intentionally** — Blender origin becomes the Roblox pivot point. Base for props, center for symmetric objects.
+- **Roblox-safe names** — PascalCase, no special characters: `WallSegment_2m`, `RoofTile_Corner`, `DoorFrame_Single`
+
+### Collision Meshes
+
+- Create simplified collision meshes for complex models — `_Collision` suffix (e.g., `TreeTrunk_Collision`)
+- Roblox collision works best with **convex shapes** — decompose concave models into multiple convex parts
+- Collision meshes do not need textures or materials
+
+### Roblox Avatar and Accessory Rules
+
+When building UGC accessories or avatar items:
+
+- **Follow R15 rig structure** — use Roblox-provided templates for attachment points
+- **Attachment naming** — must match Roblox attachment names exactly: `HatAttachment`, `HairAttachment`, `FaceAttachment`, etc.
+- **Cage meshes** — layered clothing requires inner and outer cage meshes for proper deformation
+- **Triangle budget for accessories** — keep well under 10,000; hats and simple accessories should target 2,000–4,000
+- **Size limits** — accessories must fit within Roblox's bounding box limits for their category
+
+### Modular Map Design
+
+When building maps and environments:
+
+- **Reusable tiles** — wall segments, floor tiles, roof pieces that snap together
+- **Stud-aligned grid** — dimensions in multiples of 0.28m or whole studs
+- **Hollow interiors** — thin shells, not solid walls — saves triangles
+- **Zone collections** — group by area: `Zone_Spawn`, `Zone_Arena`, `Zone_Lobby`
+
+### Batch Export for Maps
+
+When a map has many separate pieces, export each object or collection as its own `.fbx`:
+
+```python
+import bpy
+import os
+
+export_dir = "/path/to/exports"
+os.makedirs(export_dir, exist_ok=True)
+
+# Deselect all
+bpy.ops.object.select_all(action='DESELECT')
+
+for obj in bpy.data.collections["Zone_Spawn"].objects:
+    if obj.type != 'MESH':
+        continue
+
+    bpy.ops.object.select_all(action='DESELECT')
+    obj.select_set(True)
+    bpy.context.view_layer.objects.active = obj
+
+    filepath = os.path.join(export_dir, f"{obj.name}.fbx")
+    bpy.ops.export_scene.fbx(
+        filepath=filepath,
+        use_selection=True,
+        apply_scale_options='FBX_SCALE_ALL',
+        axis_forward='-Z',
+        axis_up='Y',
+        use_mesh_modifiers=True,
+        mesh_smooth_type='FACE',
+        use_mesh_edges=False,
+        bake_anim=False
+    )
+    print(f"Exported: {filepath}")
+```
+
+Never export an entire map as one monolithic `.fbx`. Keep pieces modular for Roblox Studio.
+
+### Pre-Export Validation Checklist
+
+The agent must run this checklist before every export:
+
+| Check                        | Requirement                             |
+|------------------------------|-----------------------------------------|
+| Triangle count per mesh      | < 10,000                                |
+| Total mesh count             | < 200                                   |
+| All transforms applied       | Location, Rotation, Scale               |
+| All meshes triangulated      | No quads or n-gons                      |
+| Normals facing outward       | No flipped normals                      |
+| No loose geometry            | No floating verts/edges                 |
+| No interior faces            | Hidden geometry removed                 |
+| One material per object      | Clean SurfaceAppearance mapping         |
+| UV maps present              | On every textured mesh                  |
+| Procedurals baked            | No unbaked procedural materials         |
+| Texture resolution           | <= 1024x1024                            |
+| Descriptive object names     | PascalCase, no special characters       |
+| Origins set correctly        | Intentional pivot placement             |
+| Scale consistent             | Same unit convention across all models  |
+| Thin objects solidified      | No single-sided faces on visible meshes |
+| Collision meshes created     | For complex or concave models           |
+
+### FBX Export Settings
+
+```python
+import bpy
+
+bpy.ops.export_scene.fbx(
+    filepath="/path/to/export.fbx",
+    use_selection=True,
+    apply_scale_options='FBX_SCALE_ALL',
+    axis_forward='-Z',
+    axis_up='Y',
+    use_mesh_modifiers=True,
+    mesh_smooth_type='FACE',
+    use_mesh_edges=False,
+    bake_anim=False
+)
+```
+
+Always export with `use_mesh_modifiers=True` so Triangulate and Decimate modifiers are baked in.
+
+### Roblox Studio Import Verification
+
+After importing into Roblox Studio, verify:
+
+- [ ] Model scale matches expectations (compare to a default Roblox Part)
+- [ ] SurfaceAppearance textures loaded on all MeshParts
+- [ ] No missing or flipped faces when rotating the camera around the model
+- [ ] Collision behaves correctly (walk into it, stand on it)
+- [ ] Transparency and special materials flagged during export are configured in Studio
+- [ ] Performance is acceptable (check MicroProfiler if the map is large)
+
+---
+
+## File Versioning
+
+### Blend File Saves
+
+- Save `.blend` files with version suffixes: `MapArena_v01.blend`, `MapArena_v02.blend`
+- Increment the version before major changes so you can roll back
+- Keep a `_latest` symlink or copy if preferred: `MapArena_latest.blend`
+
+### Exported FBX Naming
+
+- Match the Blender object name: `WallSegment_2m.fbx`, `RoofTile_Corner.fbx`
+- For versioned exports: `WallSegment_2m_v02.fbx`
+- Store exports in a dedicated folder: `exports/` or `exports/v02/`
+
+---
+
 ## Lighting Best Practices
 
 ### Three-Point Lighting Setup
